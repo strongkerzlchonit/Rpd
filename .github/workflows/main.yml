@@ -12,9 +12,7 @@ concurrency:
 
 jobs:
   secure-rdp:
-    # Requires a larger runner with this label.
-    # Use windows-latest if this label is unavailable.
-    runs-on: windows-2022-16core
+    runs-on: windows-latest
     timeout-minutes: 360
 
     env:
@@ -26,7 +24,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          $rdpFirewallRule = "RDP-Tailscale"
+          $firewallRule = "RDP-Tailscale"
 
           Set-ItemProperty `
             -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
@@ -47,11 +45,11 @@ jobs:
             -Force
 
           netsh advfirewall firewall delete rule `
-            name="$rdpFirewallRule" |
+            name="$firewallRule" |
             Out-Null
 
           netsh advfirewall firewall add rule `
-            name="$rdpFirewallRule" `
+            name="$firewallRule" `
             dir=in `
             action=allow `
             protocol=TCP `
@@ -60,14 +58,14 @@ jobs:
             profile=any
 
           Restart-Service `
-            -Name TermService `
+            -Name "TermService" `
             -Force
 
-          $rdpService = Get-Service `
-            -Name TermService `
+          $service = Get-Service `
+            -Name "TermService" `
             -ErrorAction Stop
 
-          if ($rdpService.Status -ne "Running") {
+          if ($service.Status -ne "Running") {
             throw "Remote Desktop service failed to start."
           }
 
@@ -78,7 +76,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          $rdpUsername = "runneradmin"
+          $username = "runneradmin"
           $characters = "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#$%^&*_-+="
           $passwordLength = 24
 
@@ -91,8 +89,8 @@ jobs:
             $characters[$_ % $characters.Length]
           })
 
-          # Make the password available to later steps.
-          # This version intentionally does not mask it.
+          # Store the password for later steps.
+          # This workflow intentionally displays it in the Actions log.
           "RDP_PASSWORD=$password" | Out-File `
             -FilePath $env:GITHUB_ENV `
             -Encoding utf8 `
@@ -103,65 +101,65 @@ jobs:
             -AsPlainText `
             -Force
 
-          $existingUser = Get-LocalUser `
-            -Name $rdpUsername `
+          $user = Get-LocalUser `
+            -Name $username `
             -ErrorAction SilentlyContinue
 
-          if ($null -eq $existingUser) {
+          if ($null -eq $user) {
             New-LocalUser `
-              -Name $rdpUsername `
+              -Name $username `
               -Password $securePassword `
               -AccountNeverExpires `
               -Description "Temporary GitHub Actions RDP user"
           }
           else {
             Set-LocalUser `
-              -Name $rdpUsername `
+              -Name $username `
               -Password $securePassword
 
             Enable-LocalUser `
-              -Name $rdpUsername
+              -Name $username
           }
 
-          $groupMembers = Get-LocalGroupMember `
+          $members = Get-LocalGroupMember `
             -Group "Remote Desktop Users" `
             -ErrorAction SilentlyContinue
 
-          $alreadyAllowed = $groupMembers |
+          $isMember = $members |
             Where-Object {
               $_.Name -match "\\runneradmin$"
             }
 
-          if ($null -eq $alreadyAllowed) {
+          if ($null -eq $isMember) {
             Add-LocalGroupMember `
               -Group "Remote Desktop Users" `
-              -Member "$env:COMPUTERNAME\$rdpUsername"
+              -Member "$env:COMPUTERNAME\$username"
           }
 
           $verifiedUser = Get-LocalUser `
-            -Name $rdpUsername `
+            -Name $username `
             -ErrorAction SilentlyContinue
 
           if ($null -eq $verifiedUser) {
             throw "The runneradmin user could not be created or found."
           }
 
-          Write-Host "RDP username configured: $rdpUsername"
+          Write-Host "RDP username configured: runneradmin"
 
       - name: Install Tailscale
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $tailscaleVersion = "1.102.3"
-          $tailscaleUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-$tailscaleVersion-amd64.msi"
+          $version = "1.102.3"
+          $downloadUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-$version-amd64.msi"
           $installerPath = Join-Path $env:TEMP "tailscale.msi"
 
           Invoke-WebRequest `
-            -Uri $tailscaleUrl `
+            -Uri $downloadUrl `
             -OutFile $installerPath
 
-          $install = Start-Process `
+          $process = Start-Process `
             -FilePath "msiexec.exe" `
             -ArgumentList @(
               "/i",
@@ -177,8 +175,8 @@ jobs:
             -Force `
             -ErrorAction SilentlyContinue
 
-          if ($install.ExitCode -ne 0) {
-            throw "Tailscale installation failed with exit code $($install.ExitCode)."
+          if ($process.ExitCode -ne 0) {
+            throw "Tailscale installation failed with exit code $($process.ExitCode)."
           }
 
           $tailscale = Join-Path `
@@ -186,12 +184,47 @@ jobs:
             "Tailscale\tailscale.exe"
 
           if (-not (Test-Path $tailscale)) {
-            throw "Tailscale executable was not found at $tailscale."
+            throw "Tailscale executable was not found."
           }
 
-          Write-Host "Tailscale $tailscaleVersion installed."
+          Write-Host "Tailscale $version installed."
 
-      - name: Establish Tailscale Connection
+      - name: Start Tailscale Service
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $service = Get-Service `
+            -Name "Tailscale" `
+            -ErrorAction SilentlyContinue
+
+          if ($null -eq $service) {
+            throw "The Tailscale service was not found."
+          }
+
+          if ($service.Status -ne "Running") {
+            Start-Service -Name "Tailscale"
+          }
+
+          for ($attempt = 1; $attempt -le 12; $attempt++) {
+            $service = Get-Service `
+              -Name "Tailscale" `
+              -ErrorAction SilentlyContinue
+
+            if ($null -ne $service -and $service.Status -eq "Running") {
+              break
+            }
+
+            Start-Sleep -Seconds 5
+          }
+
+          if ($service.Status -ne "Running") {
+            throw "The Tailscale service failed to start."
+          }
+
+          Write-Host "Tailscale service is running."
+
+      - name: Connect To Tailscale
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -205,35 +238,7 @@ jobs:
           }
 
           if ([string]::IsNullOrWhiteSpace($env:TS_AUTH_KEY)) {
-            throw "The TAILSCALE_AUTH_KEY repository secret is not configured."
-          }
-
-          $tailscaleService = Get-Service `
-            -Name "Tailscale" `
-            -ErrorAction SilentlyContinue
-
-          if ($null -eq $tailscaleService) {
-            throw "The Tailscale service was not found."
-          }
-
-          if ($tailscaleService.Status -ne "Running") {
-            Start-Service -Name "Tailscale"
-          }
-
-          for ($attempt = 1; $attempt -le 12; $attempt++) {
-            $tailscaleService = Get-Service `
-              -Name "Tailscale" `
-              -ErrorAction SilentlyContinue
-
-            if ($null -ne $tailscaleService -and $tailscaleService.Status -eq "Running") {
-              break
-            }
-
-            Start-Sleep -Seconds 5
-          }
-
-          if ($tailscaleService.Status -ne "Running") {
-            throw "The Tailscale service failed to start."
+            throw "The TAILSCALE_AUTH_KEY repository secret is missing."
           }
 
           & $tailscale up `
@@ -261,7 +266,7 @@ jobs:
           }
 
           if ($tailscaleIp -notmatch "^\d{1,3}(\.\d{1,3}){3}$") {
-            throw "Tailscale did not assign a valid IPv4 address."
+            throw "Tailscale did not provide a valid IPv4 address."
           }
 
           "TAILSCALE_IP=$tailscaleIp" | Out-File `
@@ -269,10 +274,9 @@ jobs:
             -Encoding utf8 `
             -Append
 
-          Write-Host "Tailscale connected."
           Write-Host "Tailscale IP: $tailscaleIp"
 
-      - name: Verify RDP Accessibility
+      - name: Verify RDP
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -280,8 +284,6 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_IP)) {
             throw "TAILSCALE_IP is empty."
           }
-
-          Write-Host "Testing RDP on $env:TAILSCALE_IP:3389"
 
           $connected = $false
 
@@ -301,10 +303,10 @@ jobs:
           }
 
           if (-not $connected) {
-            throw "TCP connection to RDP port 3389 failed."
+            throw "RDP port 3389 is not accessible."
           }
 
-          Write-Host "RDP is accessible over Tailscale."
+          Write-Host "RDP is accessible."
 
       - name: Display RDP Credentials
         shell: pwsh
@@ -319,7 +321,7 @@ jobs:
           Write-Host "========================================"
           Write-Host ""
 
-      - name: Maintain Connection
+      - name: Keep RDP Active
         shell: pwsh
         run: |
           while ($true) {
