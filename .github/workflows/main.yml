@@ -6,10 +6,6 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: runneradmin-rdp
-  cancel-in-progress: true
-
 jobs:
   secure-rdp:
     runs-on: windows-latest
@@ -61,11 +57,11 @@ jobs:
             -Name "TermService" `
             -Force
 
-          $service = Get-Service `
+          $rdpService = Get-Service `
             -Name "TermService" `
             -ErrorAction Stop
 
-          if ($service.Status -ne "Running") {
+          if ($rdpService.Status -ne "Running") {
             throw "Remote Desktop service failed to start."
           }
 
@@ -89,8 +85,6 @@ jobs:
             $characters[$_ % $characters.Length]
           })
 
-          # Store the password for later steps.
-          # This workflow intentionally displays it in the Actions log.
           "RDP_PASSWORD=$password" | Out-File `
             -FilePath $env:GITHUB_ENV `
             -Encoding utf8 `
@@ -101,11 +95,11 @@ jobs:
             -AsPlainText `
             -Force
 
-          $user = Get-LocalUser `
+          $existingUser = Get-LocalUser `
             -Name $username `
             -ErrorAction SilentlyContinue
 
-          if ($null -eq $user) {
+          if ($null -eq $existingUser) {
             New-LocalUser `
               -Name $username `
               -Password $securePassword `
@@ -121,16 +115,16 @@ jobs:
               -Name $username
           }
 
-          $members = Get-LocalGroupMember `
+          $groupMembers = Get-LocalGroupMember `
             -Group "Remote Desktop Users" `
             -ErrorAction SilentlyContinue
 
-          $isMember = $members |
+          $alreadyAllowed = $groupMembers |
             Where-Object {
               $_.Name -match "\\runneradmin$"
             }
 
-          if ($null -eq $isMember) {
+          if ($null -eq $alreadyAllowed) {
             Add-LocalGroupMember `
               -Group "Remote Desktop Users" `
               -Member "$env:COMPUTERNAME\$username"
@@ -159,7 +153,7 @@ jobs:
             -Uri $downloadUrl `
             -OutFile $installerPath
 
-          $process = Start-Process `
+          $install = Start-Process `
             -FilePath "msiexec.exe" `
             -ArgumentList @(
               "/i",
@@ -175,8 +169,8 @@ jobs:
             -Force `
             -ErrorAction SilentlyContinue
 
-          if ($process.ExitCode -ne 0) {
-            throw "Tailscale installation failed with exit code $($process.ExitCode)."
+          if ($install.ExitCode -ne 0) {
+            throw "Tailscale installation failed with exit code $($install.ExitCode)."
           }
 
           $tailscale = Join-Path `
@@ -187,7 +181,7 @@ jobs:
             throw "Tailscale executable was not found."
           }
 
-          Write-Host "Tailscale $version installed."
+          Write-Host "Tailscale installed successfully."
 
       - name: Start Tailscale Service
         shell: pwsh
