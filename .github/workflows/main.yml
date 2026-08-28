@@ -85,6 +85,7 @@ jobs:
             $characters[$_ % $characters.Length]
           })
 
+          # Make the password available to later workflow steps.
           "RDP_PASSWORD=$password" | Out-File `
             -FilePath $env:GITHUB_ENV `
             -Encoding utf8 `
@@ -317,8 +318,23 @@ jobs:
 
       - name: Keep RDP Active
         shell: pwsh
+        timeout-minutes: 350
         run: |
-          while ($true) {
+          # Stop before GitHub's six-hour job limit.
+          $endTime = (Get-Date).AddMinutes(345)
+
+          while ((Get-Date) -lt $endTime) {
             Write-Host "[$(Get-Date -Format o)] RDP active"
-            Start-Sleep -Seconds 300
+
+            $remainingSeconds = [int][Math]::Ceiling(
+              ($endTime - (Get-Date)).TotalSeconds
+            )
+
+            if ($remainingSeconds -le 0) {
+              break
+            }
+
+            Start-Sleep -Seconds ([Math]::Min(300, $remainingSeconds))
           }
+
+          Write-Host "RDP session ended cleanly before the GitHub timeout."
