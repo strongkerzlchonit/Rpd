@@ -1,0 +1,236 @@
+name: runneradmin
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  secure-rdp:
+    runs-on: windows-2022-16core
+    timeout-minutes: 360
+
+    env:
+      TS_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+
+    steps:
+      - name: Configure Remote Desktop
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Set-ItemProperty `
+            -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
+            -Name "fDenyTSConnections" `
+            -Value 0 `
+            -Force
+
+          Set-ItemProperty `
+            -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
+            -Name "UserAuthentication" `
+            -Value 1 `
+            -Force
+
+          Set-ItemProperty `
+            -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
+            -Name "SecurityLayer" `
+            -Value 1 `
+            -Force
+
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" | Out-Null
+
+          netsh advfirewall firewall add rule `
+            name="RDP-Tailscale" `
+            dir=in `
+            action=allow `
+            protocol=TCP `
+            localport=3389 `
+            remoteip=100.64.0.0/10 `
+            profile=any
+
+          Restart-Service -Name TermService -Force
+
+          if ((Get-Service -Name TermService).Status -ne "Running") {
+            throw "Remote Desktop service failed to start."
+          }
+
+      - name: Create runneradmin User
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $rdpUsername = "runneradmin"
+          $characters = "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#$%^&*_-+="
+          $passwordLength = 24
+
+          $random = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+          $bytes = New-Object byte[] $passwordLength
+          $random.GetBytes($bytes)
+          $random.Dispose()
+
+          $password = -join ($bytes | ForEach-Object {
+            $characters[$_ % $characters.Length]
+          })
+
+          "RDP_PASSWORD=$password" | Out-File `
+            -FilePath $env:GITHUB_ENV `
+            -Encoding utf8 `
+            -Append
+
+          $securePassword = ConvertTo-SecureString `
+            -String $password `
+            -AsPlainText `
+            -Force
+
+          $existingUser = Get-LocalUser `
+            -Name $rdpUsername `
+            -ErrorAction SilentlyContinue
+
+          if ($null -eq $existingUser) {
+            New-LocalUser `
+              -Name $rdpUsername `
+              -Password $securePassword `
+              -AccountNeverExpires `
+              -Description "Temporary GitHub Actions RDP user"
+          }
+          else {
+            Set-LocalUser `
+              -Name $rdpUsername `
+              -Password $securePassword
+
+            Enable-LocalUser `
+              -Name $rdpUsername
+          }
+
+          $isRdpUser = Get-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -ErrorAction SilentlyContinue |
+            Where-Object {
+              $_.Name -match "\\runneradmin$"
+            }
+
+          if ($null -eq $isRdpUser) {
+            Add-LocalGroupMember `
+              -Group "Remote Desktop Users" `
+              -Member $rdpUsername
+          }
+
+          if (-not (Get-LocalUser -Name $rdpUsername -ErrorAction SilentlyContinue)) {
+            throw "The $rdpUsername user could not be created or found."
+          }
+
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $tailscaleUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = Join-Path $env:TEMP "tailscale.msi"
+
+          Invoke-WebRequest `
+            -Uri $tailscaleUrl `
+            -OutFile $installerPath
+
+          $install = Start-Process `
+            -FilePath "msiexec.exe" `
+            -ArgumentList @("/i", $installerPath, "/qn", "/norestart") `
+            -Wait `
+            -PassThru
+
+          Remove-Item `
+            -Path $installerPath `
+            -Force `
+            -ErrorAction SilentlyContinue
+
+          if ($install.ExitCode -ne 0) {
+            throw "Tailscale installation failed with exit code $($install.ExitCode)."
+          }
+
+      - name: Establish Tailscale Connection
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $tailscale = Join-Path `
+            ${env:ProgramFiles} `
+            "Tailscale\tailscale.exe"
+
+          if (-not (Test-Path $tailscale)) {
+            throw "Tailscale executable was not found."
+          }
+
+          if ([string]::IsNullOrWhiteSpace($env:TS_AUTH_KEY)) {
+            throw "The TAILSCALE_AUTH_KEY repository secret is not configured."
+          }
+
+          & $tailscale up `
+            "--auth-key=$env:TS_AUTH_KEY" `
+            "--hostname=gh-runner-$env:GITHUB_RUN_ID" `
+            "--unattended=true"
+
+          $tailscaleIp = ""
+
+          for ($attempt = 1; $attempt -le 12; $attempt++) {
+            $tailscaleIp = [string](& $tailscale ip -4 | Select-Object -First 1)
+            $tailscaleIp = $tailscaleIp.Trim()
+
+            if ($tailscaleIp -match "^\d{1,3}(\.\d{1,3}){3}$") {
+              break
+            }
+
+            Start-Sleep -Seconds 5
+          }
+
+          if ($tailscaleIp -notmatch "^\d{1,3}(\.\d{1,3}){3}$") {
+            throw "Tailscale did not assign an IPv4 address."
+          }
+
+          "TAILSCALE_IP=$tailscaleIp" | Out-File `
+            -FilePath $env:GITHUB_ENV `
+            -Encoding utf8 `
+            -Append
+
+      - name: Verify RDP Accessibility
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+
+          $connected = $false
+
+          for ($attempt = 1; $attempt -le 6; $attempt++) {
+            $connected = Test-NetConnection `
+              -ComputerName $env:TAILSCALE_IP `
+              -Port 3389 `
+              -InformationLevel Quiet
+
+            if ($connected) {
+              break
+            }
+
+            Start-Sleep -Seconds 5
+          }
+
+          if (-not $connected) {
+            throw "TCP connection to RDP port 3389 failed."
+          }
+
+          Write-Host "RDP is accessible over Tailscale."
+
+      - name: Maintain Connection
+        shell: pwsh
+        run: |
+          Write-Host ""
+          Write-Host "=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: runneradmin"
+          Write-Host "Password: $env:RDP_PASSWORD"
+          Write-Host "=================="
+          Write-Host ""
+
+          while ($true) {
+            Write-Host "[$(Get-Date -Format o)] RDP active"
+            Start-Sleep -Seconds 300
+          }
