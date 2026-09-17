@@ -2,13 +2,22 @@ name: runneradmin
 
 on:
   workflow_dispatch:
+    inputs:
+      windows_model:
+        description: "Windows runner image to use for the RDP machine"
+        required: true
+        type: choice
+        default: windows-2025
+        options:
+          - windows-2025
+          - windows-2022
 
 permissions:
   contents: read
 
 jobs:
   secure-rdp:
-    runs-on: windows-latest
+    runs-on: ${{ inputs.windows_model }}
     timeout-minutes: 360
 
     env:
